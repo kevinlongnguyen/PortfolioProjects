@@ -1,0 +1,434 @@
+# Libraries
+```{r}
+library(caret)
+library(car)
+library(randomForest)
+library(ROCR)
+library(corrplot)
+library(gridExtra)
+library(gbm)
+require(Matrix)
+```
+
+# Data Preprocessing
+```{r}
+# Load data
+df <- read.csv("Hotel Reservations.csv") 
+
+# Remove unnecessary column
+df <- df[, -1]
+
+# Convert columns to factors
+df$type_of_meal_plan <- as.factor(df$type_of_meal_plan)
+df$required_car_parking_space <- as.factor(df$required_car_parking_space)
+df$booking_status <- as.factor(ifelse(df$booking_status == "Canceled", 1, 0))
+df$arrival_month <- as.factor(month.name[df$arrival_month])
+df$room_type_reserved <- as.factor(df$room_type_reserved)
+df$market_segment_type <- as.factor(df$market_segment_type)
+df$repeated_guest <- as.factor(df$repeated_guest)
+
+# Rename columns
+names(df) <- c("Adults", "Children", "WeekendNights", "Weeknights", "Meal", 
+               "CarParking", "ReservedRoomType", "LeadTime", "ArrivalYear", 
+               "ArrivalMonth", "ArrivalDay", "MarketSegment", "RepeatedGuest", 
+               "PreviousCancellations", "SuccessfulBookings", "ADR", 
+               "TotalSpecialRequests", "Canceled")
+
+# Relevel factor columns  
+levels(df$Meal) <- c("BB", "HB", "FB", "SC")
+levels(df$ReservedRoomType) <- c("A", "B", "C", "D", "E", "F", "G")
+
+# Identify numeric columns
+num_cols <- sapply(df, is.numeric)
+num_df <- df[, num_cols]
+
+# Standardize data  
+scaled_df <- as.data.frame(scale(num_df))
+scaled_df <- cbind(scaled_df, df[, !num_cols]) 
+
+# Split data into train/test sets
+set.seed(10)
+train_idx <- sample(nrow(df), round(0.8 * nrow(df)), replace = F)
+train <- df[train_idx,]
+test <- df[-train_idx,]
+scaled_train <- scaled_df[train_idx,] 
+scaled_test <- scaled_df[-train_idx,]
+```
+
+# Exploratory Data Analysis
+```{r}
+# Correlation plot
+corrplot(cor(num_df), type = "upper")
+
+# Bar plot for canceled bookings  
+ggplot(data = df, aes(x = Canceled)) +
+  geom_bar() +
+  labs(title = "Frequency of Canceled Bookings",  
+       x = "Canceled", y = "Frequency") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Density plot comparing lead time by canceled status
+ggplot(df, aes(x = LeadTime, fill = Canceled, color = Canceled)) +
+  geom_density(alpha = 0.3) +    
+  labs(title = "Distribution of Lead Time by Canceled Status",
+       x = "Lead Time", y = "Density") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+# Majority Class Benchmark
+```{r}
+# Create dummy majority class predictions
+pred <- rep(as.factor(0), nrow(test))
+
+# Evaluate model
+maj_cmat <- confusionMatrix(data = pred, test$Canceled)
+
+# Transpose confusion matrix for easier calculation
+maj_cmat_flip <- aperm(maj_cmat$table, c(2,1)) 
+
+# Calculate evaluation metrics
+fpr <- maj_cmat_flip[1,2] / sum(maj_cmat_flip[1,]) 
+fnr <- maj_cmat_flip[2,1] / sum(maj_cmat_flip[2,])
+precision_maj <- maj_cmat_flip[2,2] / sum(maj_cmat_flip[,2])
+recall_maj <- maj_cmat_flip[2,2] / sum(maj_cmat_flip[2,])
+
+# Print metrics
+fpr
+fnr 
+precision_maj
+recall_maj
+```
+
+# Logistic Regression
+```{r}
+# Set seed for reproducibility
+set.seed(10)
+
+# Create training control object
+ctrl <- trainControl(method = "cv", number = 5, allowParallel = TRUE) 
+
+# Train model
+lr_model <- train(
+  Canceled ~ . - PreviousCancellations - SuccessfulBookings, 
+  data = scaled_train,
+  method = "glm",
+  trControl = ctrl,
+  family = binomial
+)
+
+# Make predictions
+pred <- predict(lr_model, newdata = scaled_test)
+
+# Evaluate model
+lr_cmat <- confusionMatrix(data = pred, scaled_test$Canceled)
+
+# Print model summary
+summary(lr_model)
+
+# Get variable importance
+var_imp <- varImp(lr_model, scale = FALSE)
+lr_imp <- data.frame(
+  Variable = rownames(var_imp$importance),
+  Importance = var_imp$importance[, "Overall"],
+  row.names = NULL
+)
+
+# Plot variable importance
+ggplot(data = lr_imp, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col() +
+  xlab("Variable") +   
+  ylab("Importance") +
+  coord_flip()
+
+# Transpose confusion matrix  
+lr_cmat_flip <- aperm(lr_cmat$table, c(2,1))
+
+# Calculate evaluation metrics
+fpr2 <- lr_cmat_flip[1,2] / sum(lr_cmat_flip[1,])
+fnr2 <- lr_cmat_flip[2,1] / sum(lr_cmat_flip[2,])  
+precision_lr <- lr_cmat_flip[2,2] / sum(lr_cmat_flip[,2])
+recall_lr <- lr_cmat_flip[2,2] / sum(lr_cmat_flip[2,])
+
+# Print metrics
+fpr2
+fnr2
+precision_lr
+recall_lr
+```
+
+# Penalized Logistic Regression
+```{r}
+# Load glmnet package
+library(glmnet) 
+
+# Set seed for reproducibility
+set.seed(10)  
+
+# Create training control object
+ctrl <- trainControl(method = "cv", number = 5, allowParallel = TRUE)
+
+# Define grid for hyperparameters
+grid <- expand.grid(alpha = 0:1, lambda = 0.001)
+
+# Train glmnet model
+lr_model <- train(
+  Canceled ~ ., 
+  data = scaled_train,
+  method = "glmnet",
+  trControl = ctrl,
+  tuneGrid = grid,
+  family = "binomial"
+)
+
+# Print model summary
+summary(lr_model)  
+
+# Make predictions
+pred <- predict(lr_model, newdata = scaled_test, type = "raw")
+
+# Evaluate predictions
+cmat <- confusionMatrix(data = pred, reference = scaled_test$Canceled)
+
+# Get variable importance
+var_imp <- varImp(lr_model, scale = FALSE)
+```
+
+# KNN
+```{r}
+# Create hyperparameter grid
+k_grid <- expand.grid(k = 1:10)
+names(k_grid) <- "k"
+
+# Train KNN model
+set.seed(10)
+knn_model <- train(
+  Canceled ~ .,
+  data = scaled_train,
+  method = "knn",
+  trControl = ctrl,
+  tuneGrid = k_grid  
+)
+
+# Make predictions
+pred <- predict(knn_model, newdata = scaled_test)
+
+# Evaluate model
+knn_cmat <- confusionMatrix(data = pred, scaled_test$Canceled)
+
+# Plot variable importance
+plot(varImp(knn_model, scale=F))
+
+# Extract importance  
+var_imp <- varImp(knn_model, scale = F)
+knn_imp <- data.frame(
+  Variable = rownames(var_imp$importance),
+  Importance = var_imp$importance$X0,
+  row.names = NULL
+) 
+
+# Horizontal bar plot of importance
+ggplot(data = knn_imp, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col() +
+  xlab("Variable") +
+  ylab("Importance") +    
+  coord_flip()
+  
+# Transpose confusion matrix
+knn_cmat_flip <- aperm(knn_cmat$table, c(2,1))  
+
+# Calculate metrics
+fpr3 <- knn_cmat_flip[1,2] / sum(knn_cmat_flip[1,])
+fnr3 <- knn_cmat_flip[2,1] / sum(knn_cmat_flip[2,])
+precision_knn <- knn_cmat_flip[2,2] / sum(knn_cmat_flip[,2]) 
+recall_knn <- knn_cmat_flip[2,2] / sum(knn_cmat_flip[2,])
+```
+
+# Random Forest
+```{r}
+
+# Define custom random forest model
+customRF <- list(type = "Classification",
+                 library = "randomForest",
+                 loop = NULL)
+
+customRF$parameters <- data.frame(
+  parameter = c("mtry", "ntree"),
+  class = rep("numeric", 2),
+  label = c("mtry", "ntree")  
+)
+
+customRF$grid <- function(x, y, len = NULL, search = "grid") {
+  # Function definition
+}
+
+customRF$fit <- function(x, y, wts, param, lev, last, weights, classProbs) {
+  # Fit random forest model
+  randomForest(x, y, 
+               mtry = param$mtry,
+               ntree=param$ntree)
+}
+
+customRF$predict <- function(modelFit, newdata, preProc = NULL, submodels = NULL) {
+  # Generate predictions
+  predict(modelFit, newdata)
+}
+
+customRF$prob <- function(modelFit, newdata, preProc = NULL, submodels = NULL) {
+  # Calculate prediction probabilities
+  predict(modelFit, newdata, type = "prob") 
+}
+
+customRF$sort <- function(x) {
+  # Sort predictions
+  x[order(x[,1]),] 
+}
+
+customRF$levels <- function(x) {
+  # Get classification levels
+  x$classes
+}
+
+# Hyperparameter grid
+tunegrid <- data.frame(.mtry = 10)  
+
+# Train model
+set.seed(10)
+rf_model <- train(
+  Canceled ~ .,
+  data = scaled_train,
+  method = customRF, 
+  tuneGrid = tunegrid,
+  trControl = ctrl,
+  ntree = 1000
+)
+
+# Predictions
+pred <- predict(rf_model, newdata = scaled_test)
+
+# Evaluation
+rf_cmat <- confusionMatrix(pred, scaled_test$Canceled) 
+
+# Variable importance
+var_imp <- varImp(rf_model, scale = T)
+rf_imp <- data.frame(
+  Variable = rownames(var_imp$importance),
+  Importance = var_imp$importance$Overall,
+  row.names = NULL
+) 
+
+# Plot importance
+ggplot(rf_imp, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col() +
+  coord_flip()
+
+# Additional RF model
+set.seed(10)
+model <- randomForest(
+  Canceled ~ . - LeadTime,
+  data = scaled_train,
+  mtry = 10,
+  ntree = 1000,
+  importance = T
+)
+
+# Predictions
+pred <- predict(model, newdata = test) 
+
+# Evaluation
+cmat <- confusionMatrix(pred, scaled_test$Canceled)
+
+# Importance
+importance <- importance(model) 
+
+# Extract importance
+rf_imp_acc <- data.frame(
+  Variable = rownames(importance),
+  Importance = importance[, 3],
+  row.names = NULL
+)
+
+rf_imp_gini <- data.frame(
+  Variable = rownames(importance),
+  Importance = importance[, 4],
+  row.names = NULL  
+)
+
+# Plot importance
+p1 <- ggplot(rf_imp_acc, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col() +
+  coord_flip()
+
+p2 <- ggplot(rf_imp_gini, aes(x = reorder(Variable, Importance), y = Importance)) +
+  geom_col() + 
+  coord_flip()
+  
+# Transposed confusion matrix
+rf_cmat_flip <- aperm(rf_cmat$table, c(2,1))  
+
+# Evaluation metrics
+fpr <- rf_cmat_flip[1,2] / sum(rf_cmat_flip[1,])  
+fnr <- rf_cmat_flip[2,1] / sum(rf_cmat_flip[2,])
+precision_rf <- rf_cmat_flip[2,2] / sum(rf_cmat_flip[,2])
+recall_rf <- rf_cmat_flip[2,2] / sum(rf_cmat_flip[2,])
+
+# Variable importance plot
+varImpPlot(rf_model)
+```
+
+# ROC Curves
+```{r}
+# Logistic regression predictions
+lr_pred <- predict(lr_model, newdata = scaled_test, type = "prob")[,2] 
+
+# Random forest predictions
+rf_pred <- predict(rf_model3, newdata = scaled_test, type = "prob")[,2]  
+
+# KNN predictions
+knn_pred <- predict(knn_model, newdata = scaled_test, type = "prob")[,2]
+
+# Logistic regression ROC
+lr_rates <- ROCR::prediction(lr_pred, scaled_test$Canceled == "1")
+lr_perf <- performance(lr_rates, "tpr", "fpr")
+lr_auc <- performance(lr_rates, measure = "auc")@y.values[[1]]
+
+# Random forest ROC 
+rf_rates <- ROCR::prediction(rf_pred, scaled_test$Canceled == "1")
+rf_perf <- performance(rf_rates, "tpr", "fpr")
+rf_auc <- performance(rf_rates, measure = "auc")@y.values[[1]]  
+
+# KNN ROC
+knn_rates <- ROCR::prediction(knn_pred, scaled_test$Canceled == "1") 
+knn_perf <- performance(knn_rates, "tpr", "fpr")
+knn_auc <- performance(knn_rates, measure = "auc")@y.values[[1]]
+
+# Plot ROC curves
+plot(lr_perf, col = "red", main = "ROC Curve")
+lines(x = c(0,1), y = c(0,1), col = "black")
+plot(rf_perf, col = "blue", add = TRUE)
+plot(knn_perf, col = "green", add = TRUE) 
+
+# Add legend
+legend("bottomright",  
+       legend = c("Logistic Regression (AUC = 0.871)", 
+                  "Random Forest (AUC = 0.960)",
+                  "K-Nearest Neighbors (AUC = 0.896)"),
+       col = c("red", "blue", "green"), 
+       lty = 1, cex = 0.8)
+
+# Add diagonal line  
+lines(x = c(0,1), y = c(0,1), col = "black")
+```
+
+# FPR & FNR Comparison
+```{r}
+# Algorithms to compare
+algorithms <- c('Majority', 'Logistic', 'KNN', 'Random Forest')
+
+# Create dataframe with FPR and FNR values
+fprfnr <- data.frame(
+  FPR = c(fpr, fpr2, fpr3, fpr4), 
+  FNR = c(fnr, fnr2, fnr3, fnr4),
+  row.names = algorithms
+)
+```
+
